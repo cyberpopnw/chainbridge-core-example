@@ -4,13 +4,20 @@
 package example
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ChainSafe/chainbridge-celo-module/transaction"
 	"github.com/ChainSafe/chainbridge-core/chains/evm"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/bridge"
+	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/erc1155"
+	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/erc20"
+	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/erc721"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/evmclient"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/evmgaspricer"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/evmtransaction"
@@ -21,14 +28,30 @@ import (
 	"github.com/ChainSafe/chainbridge-core/config/chain"
 	"github.com/ChainSafe/chainbridge-core/flags"
 	"github.com/ChainSafe/chainbridge-core/lvldb"
-	"github.com/ChainSafe/chainbridge-core/opentelemetry"
 	"github.com/ChainSafe/chainbridge-core/relayer"
+	"github.com/ChainSafe/chainbridge-core/relayer/message"
 	"github.com/ChainSafe/chainbridge-core/store"
 	optimism "github.com/ChainSafe/chainbridge-optimism-module"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/go-redis/redis/v8"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 )
+
+type EvmContracts struct {
+	bridge         *bridge.BridgeContract
+	erc1155Handler *erc1155.ERC1155HandlerContract
+	erc20Handler   *erc20.ERC20HandlerContract
+	erc721Handler  *erc721.ERC721HandlerContract
+}
+
+var (
+	chains map[uint8]EvmContracts
+)
+
+func init() {
+	chains = make(map[uint8]EvmContracts)
+}
 
 func Run() error {
 	errChn := make(chan error)
@@ -40,6 +63,14 @@ func Run() error {
 		panic(err)
 	}
 	blockstore := store.NewBlockStore(db)
+
+	opts, err := redis.ParseURL(viper.GetString(flags.MessageStoreFlagName))
+	if err != nil {
+		return err
+	}
+	redisDB := redis.NewClient(opts)
+	messagestore := DepositMessageStore{redisDB}
+	telemetry := &LevelDBTelemetry{&messagestore}
 
 	chains := []relayer.RelayedChain{}
 	for _, chainConfig := range configuration.ChainConfigs {
@@ -93,7 +124,7 @@ func Run() error {
 		}
 	}
 
-	r := relayer.NewRelayer(chains, &opentelemetry.ConsoleTelemetry{})
+	r := relayer.NewRelayer(chains, telemetry)
 	go r.Start(stopChn, errChn)
 
 	sysErr := make(chan os.Signal, 1)
@@ -112,4 +143,20 @@ func Run() error {
 		log.Info().Msgf("terminating got [%v] signal", sig)
 		return nil
 	}
+}
+
+type DepositMessageStore struct {
+	*redis.Client
+}
+
+type LevelDBTelemetry struct {
+	store *DepositMessageStore
+}
+
+func (t *LevelDBTelemetry) TrackDepositMessage(m *message.Message) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	t.store.Set(context.Background(), fmt.Sprintf("%d%d", m.Source, m.DepositNonce), b, time.Duration(0)).Result()
 }
