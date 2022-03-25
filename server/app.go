@@ -13,7 +13,12 @@ import (
 
 var db *redis.Client
 
-func hello(w http.ResponseWriter, req *http.Request) {
+func deposits(w http.ResponseWriter, req *http.Request) {
+	setupResponse(&w, req)
+	if (*req).Method == "OPTIONS" {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	ctx := context.Background()
 	var (
 		index uint64
@@ -21,16 +26,26 @@ func hello(w http.ResponseWriter, req *http.Request) {
 	)
 	for {
 		keys, index, err := db.Scan(ctx, index, "*", 10).Result()
-		if err != nil || index == 0 {
+		if err != nil {
 			break
 		}
 		for _, key := range keys {
-			if value, err := db.Get(ctx, key).Result(); err != nil {
+			if value, err := db.Get(ctx, key).Result(); err == nil {
 				resp = append(resp, value)
 			}
 		}
+		// No more elements
+		if index == 0 {
+			break
+		}
 	}
-	fmt.Fprintf(w, strings.Join(resp, ""))
+	fmt.Fprint(w, "[", strings.Join(resp, ","), "]")
+}
+
+func setupResponse(w *http.ResponseWriter, req *http.Request) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+    (*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+    (*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 }
 
 func headers(w http.ResponseWriter, req *http.Request) {
@@ -50,7 +65,7 @@ func Run() error {
 	}
 	db = redis.NewClient(opts)
 	defer db.Close()
-	http.HandleFunc("/hello", hello)
+	http.HandleFunc("/deposits", deposits)
 	http.HandleFunc("/headers", headers)
 
 	return http.ListenAndServe(":8090", nil)
