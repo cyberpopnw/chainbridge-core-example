@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/bridge"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/erc1155"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/contracts/erc20"
@@ -16,10 +17,12 @@ import (
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/evmgaspricer"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/evmtransaction"
 	"github.com/ChainSafe/chainbridge-core/chains/evm/calls/transactor/signAndSend"
+	"github.com/ChainSafe/chainbridge-core/chains/evm/voter"
 	"github.com/ChainSafe/chainbridge-core/config"
 	"github.com/ChainSafe/chainbridge-core/config/chain"
 	"github.com/ChainSafe/chainbridge-core/flags"
 	"github.com/ChainSafe/chainbridge-core/relayer/message"
+	"github.com/ChainSafe/chainbridge-core/types"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/go-redis/redis/v8"
@@ -71,6 +74,12 @@ func (r *RedisStoreTelemetry) addEVMChains(configuration config.Config) {
 					erc20Handler:   erc20Handler,
 					erc721Handler:  erc721Handler,
 				}
+				mh := voter.NewEVMMessageHandler(*bridgeContract)
+				mh.RegisterMessageHandler(config.Erc20Handler, voter.ERC20MessageHandler)
+				mh.RegisterMessageHandler(config.Erc721Handler, voter.ERC721MessageHandler)
+				mh.RegisterMessageHandler(config.Erc1155Handler, voter.ERC1155MessageHandler)
+				mh.RegisterMessageHandler(config.GenericHandler, voter.GenericMessageHandler)
+				r.messageHandler = mh
 			}
 		}
 	}
@@ -81,11 +90,14 @@ type DepositMessageStore struct {
 }
 
 type RedisStoreTelemetry struct {
-	store    *DepositMessageStore
-	registry map[uint8]*EvmContracts
+	store          *DepositMessageStore
+	messageHandler *voter.EVMMessageHandler
+	registry       map[uint8]*EvmContracts
 }
 
-type DepositStatus struct {
+type DepositRecord struct {
+	Source                  uint8
+	Destination             uint8
 	Sender                  common.Address
 	Recipient               common.Address
 	SourceTokenAddress      common.Address
@@ -93,6 +105,8 @@ type DepositStatus struct {
 	TokenID                 float64
 	Amount                  float64
 	Type                    message.TransferType
+	DepositNonce            uint64
+	DataHash                common.Hash
 }
 
 func (t *RedisStoreTelemetry) TrackDepositMessage(m *message.Message) {
@@ -105,44 +119,108 @@ func (t *RedisStoreTelemetry) TrackDepositMessage(m *message.Message) {
 	}
 }
 
-func (t *RedisStoreTelemetry) convert(m *message.Message) (status *DepositStatus, err error) {
-	status = &DepositStatus{}
-	status.Type = m.Type
-	status.Sender = m.Sender
+func (t *RedisStoreTelemetry) GetDepositStatus(record *DepositRecord) (message.ProposalStatus, error) {
+	chain := t.registry[record.Source]
+	res, err := chain.bridge.CallContract("getProposal", record.Source, record.DepositNonce, record.DataHash)
+	if err != nil {
+		return message.ProposalStatus{}, err
+	}
+	out := *abi.ConvertType(res[0], new(message.ProposalStatus)).(*message.ProposalStatus)
+	return out, nil
+}
+
+func (t *RedisStoreTelemetry) convert(m *message.Message) (record *DepositRecord, err error) {
+	record = &DepositRecord{}
+	record.Type = m.Type
+	record.Sender = m.Sender
+	record.DepositNonce = m.DepositNonce
+	proposal, err := t.messageHandler.HandleMessage(m)
+	if err != nil {
+		return record, err
+	}
+	record.DataHash = proposal.GetDataHash()
 	switch m.Type {
+	case message.FungibleTransfer:
+		num, err := parseFloat64(m.Payload[0])
+		if err != nil {
+			return nil, err
+		}
+		record.Amount = num
+
+		if addr, ok := m.Payload[1].([]byte); ok {
+			record.Recipient = common.BytesToAddress(addr)
+		}
+
+		out, err := t.resourceIdToContractAddress(m.Source, m.ResourceId, func(ec *EvmContracts) *contracts.Contract { return &ec.erc20Handler.Contract })
+		if err != nil {
+			return record, err
+		}
+		record.SourceTokenAddress = *out
+		out, err = t.resourceIdToContractAddress(m.Destination, m.ResourceId, func(ec *EvmContracts) *contracts.Contract { return &ec.erc20Handler.Contract })
+		if err != nil {
+			return record, err
+		}
+		record.DestinationTokenAddress = *out
+	case message.NonFungibleTransfer:
+		tokenId, err := parseFloat64(m.Payload[0])
+		if err != nil {
+			return nil, err
+		}
+		record.TokenID = tokenId
+
+		if addr, ok := m.Payload[1].([]byte); ok {
+			record.Recipient = common.BytesToAddress(addr)
+		}
+
+		out, err := t.resourceIdToContractAddress(m.Source, m.ResourceId, func(ec *EvmContracts) *contracts.Contract { return &ec.erc721Handler.Contract })
+		if err != nil {
+			return record, err
+		}
+		record.SourceTokenAddress = *out
+		out, err = t.resourceIdToContractAddress(m.Destination, m.ResourceId, func(ec *EvmContracts) *contracts.Contract { return &ec.erc721Handler.Contract })
+		if err != nil {
+			return record, err
+		}
+		record.DestinationTokenAddress = *out
+
 	case message.SemiFungibleTransfer:
 		num, err := parseFloat64(m.Payload[0])
 		if err != nil {
 			return nil, err
 		}
-		status.TokenID = num
+		record.TokenID = num
 		num, err = parseFloat64(m.Payload[1])
 		if err != nil {
 			return nil, err
 		}
-		status.Amount = num
+		record.Amount = num
 
 		if addr, ok := m.Payload[2].([]byte); ok {
-			status.Recipient = common.BytesToAddress(addr)
+			record.Recipient = common.BytesToAddress(addr)
 		}
 
-		chain := t.registry[m.Source]
-		res, err := chain.erc1155Handler.CallContract("_resourceIDToTokenContractAddress", m.ResourceId)
+		out, err := t.resourceIdToContractAddress(m.Source, m.ResourceId, func(chain *EvmContracts) *contracts.Contract { return &chain.erc1155Handler.Contract })
 		if err != nil {
-			return status, err
+			return record, err
 		}
-		out := abi.ConvertType(res[0], new(common.Address)).(*common.Address)
-		status.SourceTokenAddress = *out
-		chain = t.registry[m.Destination]
-		res, err = chain.erc1155Handler.CallContract("_resourceIDToTokenContractAddress", m.ResourceId)
+		record.SourceTokenAddress = *out
+		out, err = t.resourceIdToContractAddress(m.Destination, m.ResourceId, func(chain *EvmContracts) *contracts.Contract { return &chain.erc1155Handler.Contract })
 		if err != nil {
-			return status, err
+			return record, err
 		}
-		out = abi.ConvertType(res[0], new(common.Address)).(*common.Address)
-		status.DestinationTokenAddress = *out
-
+		record.DestinationTokenAddress = *out
 	}
-	return status, nil
+	return record, nil
+}
+
+func (t *RedisStoreTelemetry) resourceIdToContractAddress(chainId uint8, resourceId types.ResourceID, getHandler func(*EvmContracts) *contracts.Contract) (*common.Address, error) {
+	chain := t.registry[chainId]
+	res, err := getHandler(chain).CallContract("_resourceIDToTokenContractAddress", resourceId)
+	if err != nil {
+		return nil, err
+	}
+	out := abi.ConvertType(res[0], new(common.Address)).(*common.Address)
+	return out, nil
 }
 
 func parseFloat64(payload interface{}) (float64, error) {
